@@ -84,7 +84,11 @@ def get_db_url():
         url = st.secrets["DATABASE_URL"]
     except Exception:
         url = os.getenv("DATABASE_URL", "")
-    return url.replace("postgresql+asyncpg://", "postgresql://")
+    # Normalize — asyncpg needs plain postgresql://
+    url = url.strip()
+    url = url.replace("postgresql+asyncpg://", "postgresql://")
+    url = url.replace("postgres://", "postgresql://")
+    return url
 
 
 def run(coro):
@@ -153,7 +157,12 @@ async def _get_user(username):
 try:
     run(_create_table())
 except Exception as e:
+    url = get_db_url()
+    # Show partial URL for debugging (hide password)
+    import re
+    safe_url = re.sub(r":([^@]+)@", ":****@", url)
     st.error(f"❌ Database connection failed: {e}")
+    st.error(f"Attempted URL: {safe_url}")
     st.stop()
 
 
