@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+daf.egg-info/
+setup.py
+setup.cfg
+conftest.py
