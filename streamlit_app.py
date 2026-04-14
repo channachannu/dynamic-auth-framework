@@ -101,7 +101,7 @@ def run(coro):
 
 
 async def _create_table():
-    conn = await asyncpg.connect(get_db_url())
+    conn = await asyncpg.connect(get_db_url(), ssl="require")
     try:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS daf_users (
@@ -121,7 +121,7 @@ async def _create_table():
 
 
 async def _user_exists(username):
-    conn = await asyncpg.connect(get_db_url())
+    conn = await asyncpg.connect(get_db_url(), ssl="require")
     try:
         row = await conn.fetchrow(
             "SELECT id FROM daf_users WHERE username = $1", username)
@@ -131,7 +131,7 @@ async def _user_exists(username):
 
 
 async def _create_user(username, static_hash, parameter_map, placeholder):
-    conn = await asyncpg.connect(get_db_url())
+    conn = await asyncpg.connect(get_db_url(), ssl="require")
     try:
         await conn.execute("""
             INSERT INTO daf_users (username, static_hash, parameter_map, placeholder)
@@ -142,7 +142,7 @@ async def _create_user(username, static_hash, parameter_map, placeholder):
 
 
 async def _get_user(username):
-    conn = await asyncpg.connect(get_db_url())
+    conn = await asyncpg.connect(get_db_url(), ssl="require")
     try:
         row = await conn.fetchrow(
             "SELECT * FROM daf_users WHERE username = $1", username)
@@ -160,7 +160,7 @@ except Exception as e:
     url = get_db_url()
     # Show partial URL for debugging (hide password)
     import re
-    safe_url = re.sub(r":([^@]+)@", ":****@", url)
+    safe_url = re.sub(r"(://\w+:)([^@]+)(@)", r"\g<1>****\g<3>", url)
     st.error(f"❌ Database connection failed: {e}")
     st.error(f"Attempted URL: {safe_url}")
     st.stop()
