@@ -1,24 +1,161 @@
 """
 streamlit_app.py
 =================
-DAF Phase 1 — Stakeholder Demo UI.
+DAF Phase 1 — Stakeholder Demo UI (Standalone Version)
 
-Run:
-    streamlit run streamlit_app.py
+This version works WITHOUT FastAPI — it calls the database directly.
+Designed for Streamlit Cloud deployment.
 
-Requirements:
-    FastAPI must be running → uvicorn main:app --reload
+Architecture:
+    Streamlit UI
+         ↓
+    DPP Core Logic (inlined)
+         ↓
+    Supabase PostgreSQL (via asyncpg)
 """
 
-import sys
+import asyncio
+import hmac
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import requests
 from datetime import datetime, timezone
-import streamlit as st
 
-API_BASE = "http://localhost:8000/v1/auth"
+import streamlit as st
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+import asyncpg
+
+# ---------------------------------------------------------------------------
+# DPP Core Logic
+# ---------------------------------------------------------------------------
+_HASHER = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4, hash_len=32)
+DEFAULT_PLACEHOLDER = "x"
+
+
+def _build_parameter_map(password, placeholder):
+    return "".join("1" if ch == placeholder else "0" for ch in password)
+
+def _extract_static_part(password, parameter_map):
+    return "".join(ch for ch, flag in zip(password, parameter_map) if flag == "0")
+
+def _extract_dynamic_part(password, parameter_map):
+    return "".join(ch for ch, flag in zip(password, parameter_map) if flag == "1")
+
+def _get_current_time_parameter():
+    return datetime.now(tz=timezone.utc).strftime("%H%M")
+
+def _secure_compare(a, b):
+    return hmac.compare_digest(a.encode(), b.encode())
+
+def dpp_register(password, placeholder=DEFAULT_PLACEHOLDER):
+    """Register — returns (static_hash, parameter_map)."""
+    if not password:
+        raise ValueError("Password must not be empty.")
+    if len(placeholder) != 1:
+        raise ValueError("Placeholder must be exactly one character.")
+    if all(ch == placeholder for ch in password):
+        raise ValueError("Password must contain at least one static character.")
+    parameter_map = _build_parameter_map(password, placeholder)
+    static_part   = _extract_static_part(password, parameter_map)
+    static_hash   = _HASHER.hash(static_part)
+    return static_hash, parameter_map
+
+def dpp_authenticate(input_password, stored_hash, parameter_map):
+    """Two-stage DPP authentication — returns True/False."""
+    if len(input_password) != len(parameter_map):
+        return False
+    dynamic_part = _extract_dynamic_part(input_password, parameter_map)
+    live_dynamic = _get_current_time_parameter()
+    if not _secure_compare(dynamic_part, live_dynamic):
+        return False
+    static_part = _extract_static_part(input_password, parameter_map)
+    try:
+        _HASHER.verify(stored_hash, static_part)
+        return True
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+def get_db_url():
+    """Get DATABASE_URL from Streamlit secrets or environment."""
+    try:
+        url = st.secrets["DATABASE_URL"]
+    except Exception:
+        url = os.getenv("DATABASE_URL", "")
+    return url.replace("postgresql+asyncpg://", "postgresql://")
+
+
+def run(coro):
+    """Run async coroutine safely from Streamlit's sync context."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+async def _create_table():
+    conn = await asyncpg.connect(get_db_url())
+    try:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS daf_users (
+                id            SERIAL PRIMARY KEY,
+                username      VARCHAR(50) UNIQUE NOT NULL,
+                static_hash   TEXT NOT NULL,
+                parameter_map VARCHAR(256) NOT NULL,
+                placeholder   VARCHAR(1) NOT NULL DEFAULT 'x',
+                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_daf_users_username
+                ON daf_users(username);
+        """)
+    finally:
+        await conn.close()
+
+
+async def _user_exists(username):
+    conn = await asyncpg.connect(get_db_url())
+    try:
+        row = await conn.fetchrow(
+            "SELECT id FROM daf_users WHERE username = $1", username)
+        return row is not None
+    finally:
+        await conn.close()
+
+
+async def _create_user(username, static_hash, parameter_map, placeholder):
+    conn = await asyncpg.connect(get_db_url())
+    try:
+        await conn.execute("""
+            INSERT INTO daf_users (username, static_hash, parameter_map, placeholder)
+            VALUES ($1, $2, $3, $4)
+        """, username, static_hash, parameter_map, placeholder)
+    finally:
+        await conn.close()
+
+
+async def _get_user(username):
+    conn = await asyncpg.connect(get_db_url())
+    try:
+        row = await conn.fetchrow(
+            "SELECT * FROM daf_users WHERE username = $1", username)
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Startup — ensure table exists
+# ---------------------------------------------------------------------------
+try:
+    run(_create_table())
+except Exception as e:
+    st.error(f"❌ Database connection failed: {e}")
+    st.stop()
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -92,15 +229,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🕐 Live UTC Time")
-    utc_now  = datetime.now(tz=timezone.utc)
-    hhmm     = utc_now.strftime("%H%M")
+    utc_now = datetime.now(tz=timezone.utc)
+    hhmm    = utc_now.strftime("%H%M")
     st.metric("Current UTC", utc_now.strftime("%H:%M:%S"))
     st.info(f"Dynamic value now: **{hhmm}**")
+    if st.button("🔄 Refresh Clock"):
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_reg, tab_auth, tab_how = st.tabs(["📝 Register", "🔑 Authenticate", "📖 How It Works"])
+tab_reg, tab_auth, tab_how = st.tabs([
+    "📝 Register", "🔑 Authenticate", "📖 How It Works"
+])
 
 # ── REGISTER ─────────────────────────────────────────────────────────────────
 with tab_reg:
@@ -114,11 +255,13 @@ with tab_reg:
 
     with st.form("register_form"):
         username    = st.text_input("Username", placeholder="e.g. Botnet")
-        password    = st.text_input("Password", placeholder="e.g. Botxxnetxx", type="password")
+        password    = st.text_input(
+            "Password", placeholder="e.g. Botxxnetxx", type="password")
         show        = st.checkbox("Show password")
         if show and password:
             st.code(password)
-        placeholder = st.text_input("Placeholder character", value="x", max_chars=1)
+        placeholder = st.text_input(
+            "Placeholder character", value="x", max_chars=1)
         submitted   = st.form_submit_button("Register", use_container_width=True)
 
     if submitted:
@@ -127,35 +270,36 @@ with tab_reg:
         else:
             with st.spinner("Registering..."):
                 try:
-                    res = requests.post(
-                        f"{API_BASE}/register",
-                        json={"username": username, "password": password, "placeholder": placeholder},
-                        timeout=10,
-                    )
-                    if res.status_code == 201:
-                        data = res.json()
-                        pmap = data["parameter_map"]
-                        st.markdown('<div class="success-card">✅ <b>Registration successful!</b></div>',
-                                    unsafe_allow_html=True)
+                    if run(_user_exists(username)):
+                        st.markdown(
+                            '<div class="error-card">❌ Username already taken.</div>',
+                            unsafe_allow_html=True)
+                    else:
+                        static_hash, parameter_map = dpp_register(password, placeholder)
+                        run(_create_user(username, static_hash, parameter_map, placeholder))
+
+                        st.markdown(
+                            '<div class="success-card">✅ <b>Registration successful!</b></div>',
+                            unsafe_allow_html=True)
 
                         col1, col2, col3 = st.columns(3)
-                        col1.metric("Password Length", len(pmap))
-                        col2.metric("Static positions",  pmap.count("0"))
-                        col3.metric("Dynamic positions", pmap.count("1"))
+                        col1.metric("Password Length",   len(parameter_map))
+                        col2.metric("Static positions",  parameter_map.count("0"))
+                        col3.metric("Dynamic positions", parameter_map.count("1"))
 
-                        st.markdown(f"**Parameter map:** `{pmap}`")
-                        st.info(f"At current UTC **{hhmm}**, fill your `{placeholder}` positions with `{hhmm[:pmap.count('1')]}`")
-
+                        st.markdown(f"**Parameter map:** `{parameter_map}`")
+                        st.info(
+                            f"At current UTC **{hhmm}**, fill your `{placeholder}` "
+                            f"positions with the current time digits."
+                        )
                         st.session_state["registered_user"] = username
-                    else:
-                        try:
-                            detail = res.json().get("detail", "Registration failed.")
-                        except Exception:
-                            detail = f"Registration failed. (HTTP {res.status_code})"
-                        st.markdown(f'<div class="error-card">❌ {detail}</div>', unsafe_allow_html=True)
 
-                except requests.exceptions.ConnectionError:
-                    st.error("❌ Cannot connect to DAF API. Is FastAPI running on port 8000?")
+                except ValueError as e:
+                    st.markdown(
+                        f'<div class="error-card">❌ {str(e)}</div>',
+                        unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
 
 # ── AUTHENTICATE ─────────────────────────────────────────────────────────────
 with tab_auth:
@@ -192,26 +336,41 @@ with tab_auth:
         else:
             with st.spinner("Verifying..."):
                 try:
-                    res = requests.post(
-                        f"{API_BASE}/authenticate",
-                        json={"username": auth_user, "password": auth_pass},
-                        timeout=10,
-                    )
-                    if res.status_code == 200:
-                        st.markdown('<div class="success-card">✅ <b>Authentication successful!</b><br>Both dynamic and static stages verified.</div>',
-                                    unsafe_allow_html=True)
-                        col1, col2 = st.columns(2)
-                        col1.metric("Stage 1 — Dynamic", "✅ Passed")
-                        col2.metric("Stage 2 — Static",  "✅ Passed")
-                    else:
-                        st.markdown('<div class="error-card">❌ <b>Authentication failed.</b><br>Check your dynamic positions match current UTC time.</div>',
-                                    unsafe_allow_html=True)
-                        col1, col2 = st.columns(2)
-                        col1.metric("Stage 1 — Dynamic", "❌ Failed")
-                        col2.metric("Stage 2 — Static",  "—")
+                    user = run(_get_user(auth_user))
 
-                except requests.exceptions.ConnectionError:
-                    st.error("❌ Cannot connect to DAF API. Is FastAPI running on port 8000?")
+                    if not user:
+                        st.markdown(
+                            '<div class="error-card">❌ <b>Invalid credentials.</b></div>',
+                            unsafe_allow_html=True)
+                    elif not user["is_active"]:
+                        st.markdown(
+                            '<div class="error-card">❌ <b>Account is inactive.</b></div>',
+                            unsafe_allow_html=True)
+                    else:
+                        success = dpp_authenticate(
+                            input_password=auth_pass,
+                            stored_hash=user["static_hash"],
+                            parameter_map=user["parameter_map"],
+                        )
+                        if success:
+                            st.markdown(
+                                '<div class="success-card">✅ <b>Authentication successful!</b>'
+                                '<br>Both dynamic and static stages verified.</div>',
+                                unsafe_allow_html=True)
+                            col1, col2 = st.columns(2)
+                            col1.metric("Stage 1 — Dynamic", "✅ Passed")
+                            col2.metric("Stage 2 — Static",  "✅ Passed")
+                        else:
+                            st.markdown(
+                                '<div class="error-card">❌ <b>Authentication failed.</b>'
+                                '<br>Check your dynamic positions match current UTC time.</div>',
+                                unsafe_allow_html=True)
+                            col1, col2 = st.columns(2)
+                            col1.metric("Stage 1 — Dynamic", "❌ Failed")
+                            col2.metric("Stage 2 — Static",  "—")
+
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
 
 # ── HOW IT WORKS ─────────────────────────────────────────────────────────────
 with tab_how:
@@ -223,7 +382,7 @@ with tab_how:
     col3.markdown("**Parameter Map**"); col3.code("0001100011")
 
     st.markdown("---")
-    st.markdown("**Login examples:**")
+    st.markdown("**Login examples with pattern `Botxxnetxx`:**")
     st.table({
         "UTC Time":       ["21:30", "21:31", "22:30"],
         "Login Password": ["Bot21net30", "Bot21net31", "Bot22net30"],
@@ -231,12 +390,21 @@ with tab_how:
     })
 
     st.markdown("---")
+    st.markdown("**Two-stage verification:**")
+    st.markdown("""
+    1. **Stage 1 — Dynamic** — extracted digits must match current UTC time
+    2. **Stage 2 — Static** — extracted letters must match stored Argon2id hash
+
+    Both stages must pass. All failures return a **generic message**.
+    """)
+
+    st.markdown("---")
     st.markdown("**Security:**")
     st.table({
-        "Attack":        ["Replay", "Brute Force", "Phishing", "DB Breach"],
-        "DPP Defence":   [
+        "Attack":      ["Replay", "Brute Force", "Phishing", "DB Breach"],
+        "DPP Defence": [
             "Password expires every 60s",
-            "Argon2id — ~100ms per attempt",
+            "Argon2id — 64MB RAM per attempt",
             "Stolen password immediately stale",
             "Only hash + parameter map stored",
         ],
@@ -249,5 +417,5 @@ st.markdown("---")
 st.caption(
     "Dynamic Auth Framework — Phase 1 POC  |  "
     "H. Channabasava & S. Kanthimathi, CompCom 2019  |  "
-    "FastAPI + PostgreSQL + Streamlit"
+    "Supabase PostgreSQL + Streamlit"
 )
