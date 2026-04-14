@@ -1,28 +1,27 @@
 """
 streamlit_app.py
 =================
-DAF Phase 1 — Stakeholder Demo UI (Standalone Version)
+DAF Phase 1 — Stakeholder Demo UI
 
-This version works WITHOUT FastAPI — it calls the database directly.
-Designed for Streamlit Cloud deployment.
+Uses Supabase REST API (HTTPS) — works on Streamlit Cloud free tier.
+No direct PostgreSQL connection needed.
 
 Architecture:
-    Streamlit UI
+    Streamlit Cloud
+         ↓  HTTPS
+    Supabase REST API
          ↓
-    DPP Core Logic (inlined)
-         ↓
-    Supabase PostgreSQL (via asyncpg)
+    PostgreSQL (managed by Supabase)
 """
 
-import asyncio
 import hmac
 import os
 from datetime import datetime, timezone
 
 import streamlit as st
+from supabase import create_client, Client
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
-import asyncpg
 
 # ---------------------------------------------------------------------------
 # DPP Core Logic
@@ -76,93 +75,63 @@ def dpp_authenticate(input_password, stored_hash, parameter_map):
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Supabase client
 # ---------------------------------------------------------------------------
-def get_db_url():
-    """Get DATABASE_URL from Streamlit secrets or environment."""
+@st.cache_resource
+def get_supabase() -> Client:
+    """Create and cache the Supabase client."""
     try:
-        url = st.secrets["DATABASE_URL"]
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
     except Exception:
-        url = os.getenv("DATABASE_URL", "")
-    # Normalize — asyncpg needs plain postgresql://
-    url = url.strip()
-    url = url.replace("postgresql+asyncpg://", "postgresql://")
-    url = url.replace("postgres://", "postgresql://")
-    return url
-
-
-def run(coro):
-    """Run async coroutine safely from Streamlit's sync context."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
-
-async def _create_table():
-    conn = await asyncpg.connect(get_db_url(), ssl="require")
-    try:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS daf_users (
-                id            SERIAL PRIMARY KEY,
-                username      VARCHAR(50) UNIQUE NOT NULL,
-                static_hash   TEXT NOT NULL,
-                parameter_map VARCHAR(256) NOT NULL,
-                placeholder   VARCHAR(1) NOT NULL DEFAULT 'x',
-                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_daf_users_username
-                ON daf_users(username);
-        """)
-    finally:
-        await conn.close()
-
-
-async def _user_exists(username):
-    conn = await asyncpg.connect(get_db_url(), ssl="require")
-    try:
-        row = await conn.fetchrow(
-            "SELECT id FROM daf_users WHERE username = $1", username)
-        return row is not None
-    finally:
-        await conn.close()
-
-
-async def _create_user(username, static_hash, parameter_map, placeholder):
-    conn = await asyncpg.connect(get_db_url(), ssl="require")
-    try:
-        await conn.execute("""
-            INSERT INTO daf_users (username, static_hash, parameter_map, placeholder)
-            VALUES ($1, $2, $3, $4)
-        """, username, static_hash, parameter_map, placeholder)
-    finally:
-        await conn.close()
-
-
-async def _get_user(username):
-    conn = await asyncpg.connect(get_db_url(), ssl="require")
-    try:
-        row = await conn.fetchrow(
-            "SELECT * FROM daf_users WHERE username = $1", username)
-        return dict(row) if row else None
-    finally:
-        await conn.close()
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_KEY", "")
+    return create_client(url, key)
 
 
 # ---------------------------------------------------------------------------
-# Startup — ensure table exists
+# Database operations via Supabase REST API
+# ---------------------------------------------------------------------------
+
+def db_user_exists(username: str) -> bool:
+    """Check if username already exists."""
+    supabase = get_supabase()
+    result = supabase.table("daf_users") \
+        .select("id") \
+        .eq("username", username) \
+        .execute()
+    return len(result.data) > 0
+
+
+def db_create_user(username: str, static_hash: str, parameter_map: str, placeholder: str):
+    """Insert a new user into daf_users."""
+    supabase = get_supabase()
+    supabase.table("daf_users").insert({
+        "username":      username,
+        "static_hash":   static_hash,
+        "parameter_map": parameter_map,
+        "placeholder":   placeholder,
+        "is_active":     True,
+    }).execute()
+
+
+def db_get_user(username: str) -> dict | None:
+    """Fetch a user by username."""
+    supabase = get_supabase()
+    result = supabase.table("daf_users") \
+        .select("*") \
+        .eq("username", username) \
+        .execute()
+    return result.data[0] if result.data else None
+
+
+# ---------------------------------------------------------------------------
+# Test connection on startup
 # ---------------------------------------------------------------------------
 try:
-    run(_create_table())
+    get_supabase().table("daf_users").select("id").limit(1).execute()
 except Exception as e:
-    url = get_db_url()
-    # Show partial URL for debugging (hide password)
-    import re
-    safe_url = re.sub(r"(://\w+:)([^@]+)(@)", r"\g<1>****\g<3>", url)
-    st.error(f"❌ Database connection failed: {e}")
-    st.error(f"Attempted URL: {safe_url}")
+    st.error(f"❌ Supabase connection failed: {e}")
     st.stop()
 
 
@@ -279,13 +248,13 @@ with tab_reg:
         else:
             with st.spinner("Registering..."):
                 try:
-                    if run(_user_exists(username)):
+                    if db_user_exists(username):
                         st.markdown(
                             '<div class="error-card">❌ Username already taken.</div>',
                             unsafe_allow_html=True)
                     else:
                         static_hash, parameter_map = dpp_register(password, placeholder)
-                        run(_create_user(username, static_hash, parameter_map, placeholder))
+                        db_create_user(username, static_hash, parameter_map, placeholder)
 
                         st.markdown(
                             '<div class="success-card">✅ <b>Registration successful!</b></div>',
@@ -345,7 +314,7 @@ with tab_auth:
         else:
             with st.spinner("Verifying..."):
                 try:
-                    user = run(_get_user(auth_user))
+                    user = db_get_user(auth_user)
 
                     if not user:
                         st.markdown(
@@ -426,5 +395,5 @@ st.markdown("---")
 st.caption(
     "Dynamic Auth Framework — Phase 1 POC  |  "
     "H. Channabasava & S. Kanthimathi, CompCom 2019  |  "
-    "Supabase PostgreSQL + Streamlit"
+    "Supabase + Streamlit Cloud"
 )
